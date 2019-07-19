@@ -3,7 +3,6 @@ import time
 import hashlib
 import base64
 import struct
-from ServerExceptions import *
 import logging
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s]- %(name)s - %(message)s')
@@ -22,6 +21,20 @@ UPGRADE_WS = "HTTP/1.1 101 Switching Protocols\r\n" \
              "Sec-WebSocket-Accept: {}\r\n" \
              "WebSocket-Protocol: chat\r\n\r\n"
 
+
+class WebSocketError(Exception):
+    def __init__(self, msg):
+        """websocket连接失败"""
+        self.msg = msg
+
+        
+class EmptyFrame(Exception):
+    """空信息帧，说明对方意外断开连接"""
+
+    
+class CloseFrame(Exception):
+    """用于断开连接，跳出with"""
+    
 
 def sec_key_gen(msg):
     key = msg + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
@@ -57,6 +70,7 @@ class WebSocketServer:
         self.conn = conn
         self._state = 0
         self._tmp_data = b''     # 暂存数据
+        self.close_event = []     # 自定义关闭事件，在self.close()触发
 
     def open(self):
         self._handshake()
@@ -67,7 +81,7 @@ class WebSocketServer:
 
     def getstate(self):
         # 获取连接状态
-        state_map = {0: 'READY', 1: 'CONNECTION ESTABLISHED', 2: 'HANDSHAKE FINISHED', 3: 'FAILED', -1: 'CLOSED'}
+        state_map = {0: 'READY', 1: 'CONNECTION ESTABLISHED', 2: 'HANDSHAKE FINISHED', 3: 'FAILED', -1: 'CLOSED', 4: 'HTTP REQUEST IS'}
         return self._state, state_map[self._state]
 
     @property
@@ -97,8 +111,8 @@ class WebSocketServer:
             self.conn.send(
                 bytes(HTTP_RESPONSE.format(code=501, msg=STATUS_CODE[501], date=date, length=len(date), content=date),
                       encoding='utf-8'))
-            self.conn.close()
-            self._state = 3
+            self._state = 4
+            self.data = (header, content)
             return False
         else:
             self._state = 2
@@ -115,6 +129,7 @@ class WebSocketServer:
     @staticmethod
     def _decode(info):
         if info == b'':
+            # 空帧意味着对方意外断开连接
             logging.error("Received an Empty data frame")
             raise EmptyFrame()
         payload_len = info[1] & 127
@@ -157,8 +172,13 @@ class WebSocketServer:
             fragment += data
         return fragment, opcode
 
-    def handle(self, func=None, args=()):
+    def handle(self, func=None, args=(), heartbeat: bool=False, timeout: int=-1, cycle: int=-1):
         """接受一个函数作为参数"""
+        # todo:Timeout
+        if heartbeat:
+            from multiprocessing import Process
+            p = Process(target=self.ping, args=(cycle,))
+            p.start()
         while True:
             data, opcode = self._recv()
             if opcode == 0x08:
@@ -170,8 +190,12 @@ class WebSocketServer:
                 except (IndexError, struct.error):
                     code = 1005
                     reason = b''
+                logger.info("Client ask for closing websocket with {}:{}.{}".format(code, reason, self.raddr))
                 self.close()
                 return code, reason
+            elif opcode == 0x0A:
+                # PONG
+                logger.info('Pong from {}'.format(self.raddr))
             else:
                 if func is not None:
                     func(str(data, encoding='utf-8'), *args)
@@ -212,18 +236,14 @@ class WebSocketServer:
         msg = bytes(msg, encoding=encoding)
         self.send(msg)
 
-    def ping(self, delay=5):
+    def ping(self, cycle=5):
         ping_msg = 0b10001001
         data = struct.pack('B', ping_msg)
         data += struct.pack('B', 0)
-        while True:
+        while self.state == 1:
             self.conn.send(data)
-            data = self.conn.recv(1024)
-            pong = data[0] & 127
-            if pong != 9:
-                self.close()
-                raise IOError('Connection closed by Client {}.'.format(self.raddr))
-            time.sleep(delay)
+            logger.info('ping {}'.format(self.raddr))
+            time.sleep(cycle)
 
     def sending_coroutine(self):
         """构建一个协程，方便其他模块直接向前传输数据"""
@@ -232,14 +252,17 @@ class WebSocketServer:
             self.send(bytes(data, encoding='utf-8'))
 
     def close(self, code=1000, reason=b'Normally closed.'):
+        # 执行关闭事件
+        if self.close_event:
+            for event, args in self.close_event:
+                event(*args)
         # 发送关闭控制帧, 关闭码和原因信息
-        code = struct.pack('!H', code)
-        msg = code + reason
-        self._send(fin=1, opcode=0x08, msg=msg)
+        if self.state:
+            code = struct.pack('!H', code)
+            msg = code + reason
+            self._send(fin=1, opcode=0x08, msg=msg)
         """
         Socket的close方法并不能立即释放连接
-        Socket connection won't release immediately.
-        The shutdown method is used to release it.
         Websocket要求收到关闭帧的一方在返回关闭帧后立即释放连接，否则认为非正常关闭， 状态码1006
         只有在使用multiprocess时会出现这种问题
         socket的shutdown方法的参数
@@ -269,3 +292,4 @@ class WebSocketServer:
             return True
         if self.state != -1:
             self.close()
+
